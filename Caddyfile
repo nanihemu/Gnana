@@ -1,0 +1,6 @@
+{$DOMAIN} {
+	request_body {
+		max_size 200MB
+	}
+	reverse_proxy gnana:8000
+}

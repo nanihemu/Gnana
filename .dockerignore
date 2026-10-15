@@ -1,0 +1,10 @@
+.git
+.env
+**/node_modules
+**/__pycache__
+**/*.pyc
+frontend/dist
+backend/data
+backend/venv
+*.mp4
+*.zip
