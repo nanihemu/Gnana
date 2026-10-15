@@ -37,13 +37,22 @@ def render_slide(slide, idx, total, path):
     img.save(path)
 
 
-def _tts(text, out_mp3):
-    try:
+def _tts(text, out_mp3, timeout=25):
+    """Narration via gTTS (needs internet). Falls back to silence on any failure or hang."""
+    import concurrent.futures as cf
+    if os.environ.get("GNANA_TTS", "on") == "off":  # used by tests / offline servers
+        return False
+    def run():
         from gtts import gTTS
         gTTS(text=text, lang="en").save(out_mp3)
-        return True
+    ex = cf.ThreadPoolExecutor(max_workers=1)
+    try:
+        ex.submit(run).result(timeout=timeout)
+        return os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 0
     except Exception:
         return False
+    finally:
+        ex.shutdown(wait=False)
 
 
 def build_video(slides, out_path):
@@ -63,7 +72,8 @@ def build_video(slides, out_path):
                 secs = max(7, int(len(narr.split()) / 2.2))
                 audio = ["-f", "lavfi", "-t", str(secs), "-i", "anullsrc=r=44100:cl=mono"]
             cmd = ["ffmpeg", "-y", "-loop", "1", "-i", png, *audio, "-c:v", "libx264", "-tune", "stillimage",
-                   "-c:a", "aac", "-b:a", "128k", "-pix_fmt", "yuv420p", "-r", "24", "-shortest", clip]
+                   "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",  # same audio format for every clip so concat works
+                   "-pix_fmt", "yuv420p", "-r", "24", "-shortest", clip]
             r = subprocess.run(cmd, capture_output=True)
             if r.returncode != 0:
                 raise RuntimeError(r.stderr.decode()[-400:])

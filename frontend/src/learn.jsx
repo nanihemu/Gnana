@@ -20,6 +20,7 @@ export function Library({ me, onOpenQuiz, onAsk }) {
           <div className="card" key={m.id} style={{ cursor: "pointer" }} onClick={() => setOpen(m.id)}>
             <div className="row spread"><b>{m.title}</b><span className="pill">{m.kind}</span></div>
             {m.posted_by && <div className="muted">Posted by {m.posted_by}</div>}
+            {!student && <span className={"pill " + (m.class_name ? "ok" : "bad")}>{m.class_name ? "Shared with " + m.class_name : "Private: students can't see"}</span>}
             <p className="muted">{m.summary.slice(0, 140)}…</p>
             {m.topics.map((t) => <span className="pill" key={t}>{t}</span>)}
           </div>))}
@@ -38,7 +39,9 @@ function Upload({ me, done }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const file = useRef();
-  useEffect(() => { if (me.role !== "student") api("/classrooms").then(setClasses); }, []);
+  useEffect(() => {
+    if (me.role !== "student") api("/classrooms").then((c) => { setClasses(c); if (c.length) setCls(String(c[0].id)); });
+  }, []);
   const go = async () => {
     setErr(""); setBusy(true);
     try {
@@ -48,6 +51,7 @@ function Upload({ me, done }) {
       if (file.current.files[0]) f.append("file", file.current.files[0]);
       const m = await api("/materials", { method: "POST", form: f });
       setTitle(""); setText(""); file.current.value = "";
+      if (m.warning) alert(m.warning);
       done(m);
     } catch (e) { setErr(e.message); }
     setBusy(false);
@@ -55,13 +59,14 @@ function Upload({ me, done }) {
   return (
     <div className="card">
       <h2>Add learning material</h2>
+      {!me.ai_enabled && <p className="err">AI engine is not working{me.ai_error ? ": " + me.ai_error : ""}. Images can't be read, and summaries, quizzes and videos will be very basic until this is fixed.</p>}
       <div className="grid">
         <div><label>Title (optional)</label><input value={title} onChange={(e) => setTitle(e.target.value)} /></div>
         <div><label>Learner level</label>
           <select value={level} onChange={(e) => setLevel(e.target.value)}>{LEVELS.map((l) => <option key={l}>{l}</option>)}</select></div>
         {me.role !== "student" && (
           <div><label>Share with class</label>
-            <select value={cls} onChange={(e) => setCls(e.target.value)}><option value="">Private</option>
+            <select value={cls} onChange={(e) => setCls(e.target.value)}><option value="">Private (students can't see it)</option>
               {classes.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></div>)}
       </div>
       <label>File: PDF, Word, PowerPoint, text, image, audio or video</label>
@@ -115,6 +120,33 @@ function StudentSummary({ m }) {
   );
 }
 
+function ShareBox({ m, onSaved }) {
+  const [classes, setClasses] = useState([]);
+  const [cls, setCls] = useState(m.classroom_id ? String(m.classroom_id) : "");
+  const [msg, setMsg] = useState("");
+  useEffect(() => { api("/classrooms").then(setClasses); }, []);
+  const save = async () => {
+    setMsg("");
+    try {
+      await api(`/materials/${m.id}/share`, { method: "POST", body: { classroom_id: cls ? +cls : null } });
+      setMsg(cls ? "Saved. Students in that class can now see it." : "Saved. Now private."); onSaved();
+    } catch (e) { setMsg(e.message); }
+  };
+  return (
+    <div className="card">
+      <h3>Who can see this?</h3>
+      <div className="row">
+        <select value={cls} onChange={(e) => setCls(e.target.value)} style={{ maxWidth: 320 }}>
+          <option value="">Private (only me)</option>
+          {classes.map((c) => <option key={c.id} value={c.id}>{c.name} ({c.students.length} students)</option>)}</select>
+        <button className="btn" onClick={save}>Save</button>
+      </div>
+      {msg && <p className="muted">{msg}</p>}
+      {!classes.length && <p className="err">You have no classes yet. Create one under Classes and add students first.</p>}
+    </div>
+  );
+}
+
 function MaterialDetail({ id, me, back, onOpenQuiz, onAsk }) {
   const student = me.role === "student";
   const [m, setM] = useState(null);
@@ -129,7 +161,10 @@ function MaterialDetail({ id, me, back, onOpenQuiz, onAsk }) {
     if (m && m.video_status === "processing") { const t = setTimeout(load, 3000); return () => clearTimeout(t); }
   }, [m]);
   if (!m) return <p className="muted">Loading…</p>;
-  const makeVideo = async () => { setM(await api(`/materials/${id}/video`, { method: "POST" })); };
+  const makeVideo = async () => {
+    setErr("");
+    try { setM(await api(`/materials/${id}/video`, { method: "POST" })); } catch (e) { setErr(e.message); }
+  };
   const makeQuiz = async () => {
     setBusy(true); setErr("");
     try { const q = await api(`/materials/${id}/quizzes`, { method: "POST", body: { count: +count, kind } }); onOpenQuiz(q.id); }
@@ -147,6 +182,7 @@ function MaterialDetail({ id, me, back, onOpenQuiz, onAsk }) {
         {m.topics.map((t) => <span className="pill" key={t}>{t}</span>)}
         {m.posted_by && <p className="muted">Posted by {m.posted_by}</p>}
       </div>
+      {!student && <ShareBox m={m} onSaved={load} />}
       {m.has_file && <OriginalFile m={m} />}
       {student && m.video_status === "ready" && (
         <div className="card"><h3>Explainer video</h3><video controls src={videoUrl(m.id)} /></div>)}
@@ -169,6 +205,7 @@ function MaterialDetail({ id, me, back, onOpenQuiz, onAsk }) {
           {m.video_status === "ready" && <video controls src={videoUrl(m.id)} />}
           {m.video_status === "processing" && <p className="muted">Rendering your video… this takes a minute.</p>}
           {m.video_status === "failed" && <p className="err">Failed: {m.video_error}</p>}
+          {err && m.video_status !== "failed" && <p className="err">{err}</p>}
           {(m.video_status === "none" || m.video_status === "failed") &&
             <button className="btn" onClick={makeVideo}>Generate video</button>}
         </div>

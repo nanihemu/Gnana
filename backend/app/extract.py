@@ -1,4 +1,8 @@
-"""Turn any uploaded file (doc, image, audio, video, text) into plain text for analysis."""
+"""Turn any uploaded file (doc, image, audio, video, text) into plain text for analysis.
+
+Raises ExtractError instead of returning error text, so a failure is never saved as lesson content.
+ExtractError.soft=True means the file can still be shared as-is (e.g. a video with no transcription installed).
+"""
 import os
 import shutil
 import subprocess
@@ -9,6 +13,12 @@ DOC_EXT = {".pdf", ".docx", ".pptx", ".txt", ".md", ".csv", ".html", ".htm", ".r
 IMG_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 AUDIO_EXT = {".mp3", ".wav", ".m4a", ".ogg", ".flac"}
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
+
+
+class ExtractError(Exception):
+    def __init__(self, msg, soft=False):
+        super().__init__(msg)
+        self.soft = soft
 
 
 def detect_kind(filename: str) -> str:
@@ -23,19 +33,26 @@ def detect_kind(filename: str) -> str:
 
 
 def extract_text(path: str, filename: str) -> tuple[str, str]:
-    """Returns (kind, text). Never raises for unsupported content; returns a note instead."""
+    """Returns (kind, text). Raises ExtractError on failure."""
     ext = os.path.splitext(filename.lower())[1]
     kind = detect_kind(filename)
     try:
         if kind == "image":
-            return kind, _image(path, ext)
-        if kind == "audio":
-            return kind, _transcribe(path)
-        if kind == "video":
-            return kind, _video(path)
-        return kind, _document(path, ext)
+            text = _image(path, ext)
+        elif kind == "audio":
+            text = _transcribe(path)
+        elif kind == "video":
+            text = _video(path)
+        else:
+            text = _document(path, ext)
+    except ExtractError:
+        raise
     except Exception as e:  # noqa
-        return kind, f"[Could not extract content: {e}]"
+        raise ExtractError(f"Could not read {filename}: {ai.friendly(e)}", soft=kind in ("audio", "video"))
+    if not text or not text.strip():
+        hint = " It may be a scanned PDF; upload it as images instead." if ext == ".pdf" else ""
+        raise ExtractError(f"No readable text found in {filename}.{hint}", soft=kind in ("audio", "video"))
+    return kind, text
 
 
 def _document(path, ext):
@@ -71,23 +88,32 @@ def _document(path, ext):
 
 
 def _image(path, ext):
-    # Prefer Claude vision; fall back to OCR if available.
-    text = ai.describe_image(path, ext)
-    if text:
-        return text
+    st = ai.status()
+    if st["ok"]:
+        try:
+            text = ai.describe_image(path, ext)
+        except Exception as e:  # noqa
+            raise ExtractError("Could not read the image with the AI engine: " + ai.friendly(e))
+        if text:
+            return text
     try:
         import pytesseract
         from PIL import Image
-        return pytesseract.image_to_string(Image.open(path))
+        text = pytesseract.image_to_string(Image.open(path))
+        if text.strip():
+            return text
     except Exception:
-        return "[Image uploaded, but no vision model or OCR is configured. Set ANTHROPIC_API_KEY to analyse images.]"
+        pass
+    why = st["error"] or "the AI engine is not available"
+    raise ExtractError(f"Images need the AI engine to be read, but {why}. Fix ANTHROPIC_API_KEY and try again.")
 
 
 def _transcribe(path):
     try:
         from faster_whisper import WhisperModel
     except ImportError:
-        return "[Audio uploaded, but transcription is not installed. Run: pip install faster-whisper]"
+        raise ExtractError("The file was saved and students can play it, but no summary was made because speech-to-text "
+                           "(faster-whisper) is not installed.", soft=True)
     model = WhisperModel(os.environ.get("WHISPER_MODEL", "base"), compute_type="int8")
     segs, _ = model.transcribe(path)
     return " ".join(s.text.strip() for s in segs)
@@ -95,9 +121,10 @@ def _transcribe(path):
 
 def _video(path):
     if not shutil.which("ffmpeg"):
-        return "[Video uploaded, but ffmpeg is not installed, so audio could not be extracted.]"
+        raise ExtractError("ffmpeg is not installed, so audio could not be extracted from the video.", soft=True)
     with tempfile.TemporaryDirectory() as td:
         wav = os.path.join(td, "a.wav")
-        subprocess.run(["ffmpeg", "-y", "-i", path, "-vn", "-ac", "1", "-ar", "16000", wav],
-                       capture_output=True, check=True)
+        r = subprocess.run(["ffmpeg", "-y", "-i", path, "-vn", "-ac", "1", "-ar", "16000", wav], capture_output=True)
+        if r.returncode != 0:
+            raise ExtractError("This video has no readable audio track, so no summary was made.", soft=True)
         return _transcribe(wav)

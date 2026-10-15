@@ -67,7 +67,23 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
 
 @app.get("/api/me")
 def me(u: User = Depends(current_user)):
-    return {**user_out(u), "ai_enabled": ai.enabled()}
+    st = ai.status()
+    return {**user_out(u), "ai_enabled": st["ok"], "ai_error": st["error"]}
+
+
+@app.get("/api/health")
+def health():
+    """Public status check: AI key, ffmpeg and storage. Open http://SERVER:8000/api/health to debug a deployment."""
+    import shutil as sh
+    st = ai.status()
+    try:
+        probe = os.path.join(DATA_DIR, ".probe")
+        open(probe, "w").write("x"); os.remove(probe)
+        writable = True
+    except Exception:
+        writable = False
+    return {"ok": True, "ai": {"configured": st["configured"], "working": st["ok"], "error": st["error"], "model": ai.MODEL},
+            "ffmpeg": bool(sh.which("ffmpeg")), "data_dir_writable": writable}
 
 
 # ---------------- admin ----------------
@@ -129,7 +145,7 @@ def admin_overview(db: Session = Depends(get_db), _: User = Depends(require("adm
     attempts = db.query(Attempt).all()
     avg = round(100 * sum(a.score for a in attempts) / max(sum(a.total for a in attempts), 1))
     return {"users": counts, "materials": db.query(Material).count(), "quizzes": db.query(Quiz).count(),
-            "attempts": len(attempts), "average": avg, "ai_enabled": ai.enabled()}
+            "attempts": len(attempts), "average": avg, "ai_enabled": ai.status()["ok"], "ai_error": ai.status()["error"]}
 
 
 # ---------------- classrooms ----------------
@@ -214,6 +230,8 @@ def mat_out(m: Material, full=False, db: Session | None = None):
          "topics": m.topics, "video_status": m.video_status, "video_error": m.video_error, "classroom_id": m.classroom_id,
          "created_at": m.created_at.isoformat(), "filename": m.filename, "has_file": bool(m.file_path),
          "posted_by": teacher.name if teacher else ""}
+    cl = db.get(Classroom, m.classroom_id) if (db and m.classroom_id) else None
+    d["class_name"] = cl.name if cl else ""
     if full:
         d["text"] = m.text[:20000]
     return d
@@ -236,21 +254,32 @@ async def upload_material(title: str = Form(""), text: str = Form(""), level: Op
         c = db.get(Classroom, classroom_id)
         if not c or (u.role == "teacher" and c.teacher_id != u.id):
             raise HTTPException(403, "Cannot post to that class")
-    kind, filename, body, path = "text", "", text, ""
+    kind, filename, body, path, warning = "text", "", text, "", ""
     if file and file.filename:
         filename = os.path.basename(file.filename)
         path = os.path.join(DATA_DIR, "uploads", f"{uuid.uuid4().hex}_{filename}")
         with open(path, "wb") as f:
             shutil.copyfileobj(file.file, f)
-        kind, extracted = extract.extract_text(path, filename)
+        try:
+            kind, extracted = extract.extract_text(path, filename)
+        except extract.ExtractError as e:
+            kind = extract.detect_kind(filename)
+            if not e.soft and not text.strip():  # unreadable and nothing else to learn from: don't save junk
+                os.remove(path)
+                raise HTTPException(422, str(e))
+            extracted, warning = "", str(e)
         body = (text + "\n" + extracted).strip()
     lvl = level or u.level
-    a = ai.analyze(body, lvl, title)
-    m = Material(owner_id=u.id, classroom_id=classroom_id, title=title or a.get("title") or filename or "Untitled",
+    a = ai.analyze(body, lvl, title) if body else {"summary": warning, "key_points": [], "topics": []}
+    if a.get("_fallback"):
+        warning = (warning + " " if warning else "") + f"AI summary unavailable ({a['_fallback']}); a basic summary was used."
+    m = Material(owner_id=u.id, classroom_id=classroom_id, title=title or filename or a.get("title") or "Untitled",
                  filename=filename, kind=kind, level=lvl, text=body, summary=a.get("summary", ""),
                  key_points=a.get("key_points", []), topics=a.get("topics", []), file_path=path)
     db.add(m); db.commit()
-    return mat_out(m, True, db)
+    out = mat_out(m, True, db)
+    out["warning"] = warning
+    return out
 
 
 @app.get("/api/materials")
@@ -282,6 +311,27 @@ def get_original_file(mid: int, token: str = "", db: Session = Depends(get_db)):
     if not m.file_path or not os.path.exists(m.file_path):
         raise HTTPException(404, "No original file")
     return FileResponse(m.file_path, filename=m.filename)
+
+
+class ShareIn(BaseModel):
+    classroom_id: Optional[int] = None  # None = make private
+
+
+@app.post("/api/materials/{mid}/share")
+def share_material(mid: int, body: ShareIn, db: Session = Depends(get_db), u: User = Depends(require("teacher", "admin"))):
+    """Share an already-uploaded material (and its quizzes) with a class, or make it private."""
+    m = _get_material(db, u, mid)
+    if u.role != "admin" and m.owner_id != u.id:
+        raise HTTPException(403, "Not your material")
+    if body.classroom_id:
+        c = db.get(Classroom, body.classroom_id)
+        if not c or (u.role == "teacher" and c.teacher_id != u.id):
+            raise HTTPException(404, "Class not found")
+    m.classroom_id = body.classroom_id
+    for q in db.query(Quiz).filter_by(material_id=mid):
+        q.classroom_id = body.classroom_id
+    db.commit()
+    return mat_out(m, db=db)
 
 
 class SumIn(BaseModel):
@@ -352,6 +402,8 @@ def _video_job(mid: int):
 @app.post("/api/materials/{mid}/video")
 def make_video(mid: int, db: Session = Depends(get_db), u: User = Depends(require("teacher", "admin"))):
     m = _get_material(db, u, mid)
+    if not (m.text or "").strip():
+        raise HTTPException(422, "This material has no readable text to build a video from.")
     if m.video_status == "processing":
         return mat_out(m, db=db)
     m.video_status = "processing"; db.commit()

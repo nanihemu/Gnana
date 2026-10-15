@@ -10,16 +10,58 @@ MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 _client = None
 
 
+def _key() -> str:
+    return os.environ.get("ANTHROPIC_API_KEY", "").strip().strip('"').strip("'")
+
+
+def configured() -> bool:
+    k = _key()
+    return bool(k) and "your-key-here" not in k
+
+
 def client():
     global _client
-    if _client is None and os.environ.get("ANTHROPIC_API_KEY"):
+    if _client is None and configured():
         import anthropic
-        _client = anthropic.Anthropic()
+        _client = anthropic.Anthropic(api_key=_key())
     return _client
 
 
+def friendly(e: Exception) -> str:
+    s = str(e)
+    low = s.lower()
+    if "401" in s or "authentication" in low or "invalid x-api-key" in low:
+        return "the Anthropic API key was rejected (invalid). Check ANTHROPIC_API_KEY in .env"
+    if "credit balance" in low or "billing" in low:
+        return "the Anthropic account has no credit left"
+    if "429" in s or "rate" in low and "limit" in low:
+        return "the AI service is rate-limited right now, try again shortly"
+    if "404" in s and "model" in low:
+        return f"the model '{MODEL}' was not found. Set ANTHROPIC_MODEL in .env to a model your key can use"
+    return s[:200]
+
+
+_st = {"t": 0.0, "ok": False, "error": ""}
+
+
+def status(force: bool = False) -> dict:
+    """Cached health check of the AI engine: {configured, ok, error}."""
+    import time
+    if not configured():
+        return {"configured": False, "ok": False, "error": "ANTHROPIC_API_KEY is not set"}
+    ttl = 600 if _st["ok"] else 30
+    if force or time.time() - _st["t"] > ttl:
+        try:
+            client().messages.create(model=MODEL, max_tokens=5, messages=[{"role": "user", "content": "hi"}])
+            _st.update(ok=True, error="")
+        except Exception as e:  # noqa
+            _st.update(ok=False, error=friendly(e))
+        _st["t"] = time.time()
+    return {"configured": True, "ok": _st["ok"], "error": _st["error"]}
+
+
 def enabled() -> bool:
-    return client() is not None
+    return status()["ok"]
 
 
 def _ask(system: str, user, max_tokens=4000) -> str:
@@ -68,6 +110,7 @@ def _keywords(text, n=8):
 # ---------- public API ----------
 def analyze(text: str, level: str, title: str = "") -> dict:
     text = text.strip()
+    err = ""
     if enabled() and text:
         try:
             return _json(
@@ -75,16 +118,19 @@ def analyze(text: str, level: str, title: str = "") -> dict:
                 ". Return JSON: {\"title\": str, \"summary\": str (150-250 words, level-appropriate), "
                 "\"key_points\": [str] (5-8), \"topics\": [str] (2-6 short topic tags)}.",
                 text[:60000])
-        except Exception:
-            pass
+        except Exception as e:  # noqa
+            err = friendly(e)
     sents = _sentences(text)
     kws = _keywords(text)
     scored = sorted(sents, key=lambda s: -sum(k in s.lower() for k in kws))[:5]
     ordered = [s for s in sents if s in scored]
-    return {"title": title or (sents[0][:60] if sents else "Untitled"),
-            "summary": " ".join(ordered) or text[:600],
-            "key_points": ordered or [text[:200]],
-            "topics": kws[:5] or ["general"]}
+    out = {"title": title or (sents[0][:60] if sents else "Untitled"),
+           "summary": " ".join(ordered) or text[:600],
+           "key_points": ordered or ([text[:200]] if text else []),
+           "topics": kws[:5] or ["general"]}
+    if err:
+        out["_fallback"] = err
+    return out
 
 
 def make_questions(text: str, level: str, n: int, mix: list[str], topics: list[str]) -> list[dict]:

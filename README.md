@@ -64,3 +64,13 @@ Streak, XP, per-skill and per-criterion averages are tracked and shown to the st
 ## Ideas for next steps
 
 Adaptive difficulty from weak topics, spaced-repetition reminders, LMS/Google Classroom import, YouTube URL ingestion, multilingual output, proctoring-free integrity checks, mobile app.
+
+## Troubleshooting and tests
+
+- **Check a deployment:** open `http://SERVER:8000/api/health`. It shows whether the AI key works (`ai.working`, reason in `ai.error`), whether ffmpeg exists and whether the data folder is writable.
+- **Changing `.env`:** run `docker compose up -d --force-recreate` (a plain `restart` does not reload it). No quotes or spaces around the key.
+- **Automated tests (28):** role-by-endpoint permission matrix, class sharing, uploads, quizzes, progress, video, communicator, admin:
+
+```bash
+docker compose exec -T gnana sh -c "pip install --user -q pytest httpx && python -m pytest tests -q"
+```
